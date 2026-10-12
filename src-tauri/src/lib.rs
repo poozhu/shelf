@@ -1,4 +1,5 @@
 use serde::Serialize;
+use tauri::Manager;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -214,7 +215,7 @@ fn parse_session(path: &Path, project_dir: &str) -> Option<SessionMeta> {
     })
 }
 
-/// 扫描所有项目的会话,按最近修改时间从近到远排序
+/// 扫描所有项目的会话,按最后一条用户提问时间从近到远排序
 #[tauri::command(async)]
 fn list_sessions() -> Result<Vec<SessionMeta>, String> {
     let root = projects_root().ok_or_else(|| "无法定位用户主目录".to_string())?;
@@ -324,6 +325,86 @@ fn wt_fallbacks() -> Vec<String> {
     vec![local_appdata_path(r"Microsoft\WindowsApps\wt.exe")]
 }
 
+/// Windows Terminal 内置配置文件的经典 GUID(不一定显式出现在 settings.json 里)
+fn wt_builtin_shell(guid: &str) -> Option<&'static str> {
+    match guid.to_lowercase().as_str() {
+        "{61c54bbd-c2c6-5271-96e7-009a87ff44bf}" => Some("powershell"),
+        "{0caa0dad-35be-5f56-a8ff-afceeeaa6101}" => Some("cmd"),
+        "{574e775e-4f2a-5b96-ac1e-a2962a402336}" => Some("pwsh"),
+        _ => None,
+    }
+}
+
+/// 从单个 WT 配置项推断它的 shell
+fn shell_from_wt_profile(profile: &serde_json::Value) -> Option<&'static str> {
+    if let Some(cmdline) = profile.get("commandline").and_then(|c| c.as_str()) {
+        let lower = cmdline.to_lowercase();
+        if lower.contains("pwsh") {
+            return Some("pwsh");
+        }
+        if lower.contains("powershell") {
+            return Some("powershell");
+        }
+        if lower.contains("bash") {
+            return Some("bash");
+        }
+        if lower.contains("cmd") {
+            return Some("cmd");
+        }
+    }
+    match profile.get("source").and_then(|s| s.as_str()) {
+        Some("Windows.Terminal.PowershellCore") => Some("pwsh"),
+        // WSL / Azure 等无法在本机直接恢复,交给回退逻辑
+        Some(_) => None,
+        // 无 source 且无 commandline,即经典的 Windows PowerShell 配置文件
+        None => Some("powershell"),
+    }
+}
+
+/// 推断 Windows Terminal"默认配置文件"使用的 shell,用于恢复会话时保持一致
+fn wt_default_shell() -> Option<&'static str> {
+    let paths = [
+        local_appdata_path(
+            r"Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json",
+        ),
+        local_appdata_path(
+            r"Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json",
+        ),
+        local_appdata_path(r"Microsoft\Windows Terminal\settings.json"),
+        local_appdata_path(r"Microsoft\Windows Terminal Preview\settings.json"),
+    ];
+
+    for path in paths {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let Some(guid) = json.get("defaultProfile").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        if let Some(shell) = json
+            .get("profiles")
+            .and_then(|p| p.get("list"))
+            .and_then(|l| l.as_array())
+            .and_then(|list| {
+                list.iter()
+                    .find(|p| p.get("guid").and_then(|g| g.as_str()) == Some(guid))
+            })
+            .and_then(shell_from_wt_profile)
+        {
+            return Some(shell);
+        }
+        // 内置配置文件可能不在 list 中,按经典 GUID 兜底
+        if let Some(shell) = wt_builtin_shell(guid) {
+            return Some(shell);
+        }
+    }
+    None
+}
+
 fn pwsh_fallbacks() -> Vec<String> {
     vec![r"C:\Program Files\PowerShell\7\pwsh.exe".to_string()]
 }
@@ -337,6 +418,54 @@ fn bash_fallbacks() -> Vec<String> {
         r"C:\Program Files\Git\bin\bash.exe".to_string(),
         r"C:\Program Files (x86)\Git\bin\bash.exe".to_string(),
     ]
+}
+
+/// 解析某个 shell 的可执行文件路径与"执行命令并保持窗口打开"的参数。
+/// 恢复会话的两种打开方式(WT 直接拉起 / start 新控制台)共用这份定义。
+#[cfg(windows)]
+fn shell_command(
+    shell: &str,
+    session_id: &str,
+) -> Result<(PathBuf, Vec<std::ffi::OsString>), String> {
+    use std::ffi::OsString;
+
+    let (exe, fallbacks, not_found): (&str, Vec<String>, &str) = match shell {
+        "cmd" => (
+            "cmd.exe",
+            vec![r"C:\Windows\System32\cmd.exe".to_string()],
+            "未找到 cmd",
+        ),
+        "pwsh" => ("pwsh.exe", pwsh_fallbacks(), "未找到 PowerShell 7"),
+        "powershell" => (
+            "powershell.exe",
+            powershell_fallbacks(),
+            "未找到 Windows PowerShell",
+        ),
+        "bash" => ("bash.exe", bash_fallbacks(), "未找到 Git Bash"),
+        other => return Err(format!("不支持的终端类型:{other}")),
+    };
+    let exe = resolve_exe(exe, &fallbacks).ok_or_else(|| not_found.to_string())?;
+
+    let args: Vec<OsString> = match shell {
+        "cmd" => vec![
+            "/k".into(),
+            "claude".into(),
+            "--resume".into(),
+            session_id.into(),
+        ],
+        "pwsh" | "powershell" => vec![
+            "-NoExit".into(),
+            "-Command".into(),
+            format!("claude --resume {session_id}").into(),
+        ],
+        // claude 退出后落回交互式 bash,窗口不会跟着关闭
+        _ => vec![
+            "-lc".into(),
+            format!("claude --resume {session_id}; exec bash -l").into(),
+        ],
+    };
+
+    Ok((exe, args))
 }
 
 /// 检测本机可用的终端,供用户双击时选择
@@ -437,72 +566,32 @@ fn resume_session(session_id: String, cwd: String, terminal: String) -> Result<(
 
     #[cfg(windows)]
     {
-        use std::ffi::OsString;
         use std::process::Command;
 
         let title = format!("Shelf · {}", &session_id[..8.min(session_id.len())]);
-        let resume_cmd = format!("claude --resume {session_id}");
 
-        match terminal.as_str() {
-            // Windows Terminal:直接拉起,-d 指定起始目录
-            "wt" => {
-                let exe = resolve_exe("wt.exe", &wt_fallbacks())
-                    .ok_or_else(|| "未找到 Windows Terminal".to_string())?;
-                let mut cmd = Command::new(exe);
-                cmd.arg("-d")
-                    .arg(dir)
-                    .args(["cmd", "/k", "claude", "--resume"])
-                    .arg(&session_id)
-                    .current_dir(dir);
-                scrub_env(&mut cmd);
-                cmd.spawn()
-                    .map(|_| ())
-                    .map_err(|e| format!("打开终端失败:{e}"))?;
-            }
-            // 以下 shell 统一经 start 拉起,新进程拥有真实终端句柄
-            "cmd" => {
-                let mut args: Vec<OsString> = ["cmd", "/k", "claude", "--resume"]
-                    .iter()
-                    .copied()
-                    .map(OsString::from)
-                    .collect();
-                args.push(session_id.into());
-                spawn_in_new_console(&title, args, dir)?;
-            }
-            "pwsh" => {
-                let exe = resolve_exe("pwsh.exe", &pwsh_fallbacks())
-                    .ok_or_else(|| "未找到 PowerShell 7".to_string())?;
-                spawn_in_new_console(
-                    &title,
-                    vec![
-                        exe.into_os_string(),
-                        "-NoExit".into(),
-                        "-Command".into(),
-                        resume_cmd.into(),
-                    ],
-                    dir,
-                )?;
-            }
-            "powershell" => {
-                let exe = resolve_exe("powershell.exe", &powershell_fallbacks())
-                    .ok_or_else(|| "未找到 Windows PowerShell".to_string())?;
-                spawn_in_new_console(
-                    &title,
-                    vec![
-                        exe.into_os_string(),
-                        "-NoExit".into(),
-                        "-Command".into(),
-                        resume_cmd.into(),
-                    ],
-                    dir,
-                )?;
-            }
-            "bash" => {
-                let exe = resolve_exe("bash.exe", &bash_fallbacks())
-                    .ok_or_else(|| "未找到 Git Bash".to_string())?;
-                spawn_in_new_console(&title, vec![exe.into_os_string(), "-lc".into(), resume_cmd.into()], dir)?;
-            }
-            other => return Err(format!("不支持的终端类型:{other}")),
+        if terminal == "wt" {
+            // Windows Terminal:跟随其"默认配置文件"的 shell(读 settings.json 推断),
+            // 推断失败时回退 cmd;-d 指定起始目录
+            let wt_exe = resolve_exe("wt.exe", &wt_fallbacks())
+                .ok_or_else(|| "未找到 Windows Terminal".to_string())?;
+            let shell = wt_default_shell().unwrap_or("cmd");
+            let (shell_exe, args) = shell_command(shell, &session_id)?;
+
+            let mut cmd = Command::new(wt_exe);
+            cmd.arg("-d").arg(dir).arg(shell_exe).args(args);
+            cmd.current_dir(dir);
+            scrub_env(&mut cmd);
+            cmd.spawn()
+                .map(|_| ())
+                .map_err(|e| format!("打开终端失败:{e}"))?;
+        } else {
+            // 其余 shell 统一经 start 拉起,新进程拥有真实终端句柄
+            let (shell_exe, args) = shell_command(&terminal, &session_id)?;
+            let mut full = Vec::with_capacity(args.len() + 1);
+            full.push(shell_exe.into_os_string());
+            full.extend(args);
+            spawn_in_new_console(&title, full, dir)?;
         }
     }
 
@@ -512,6 +601,14 @@ fn resume_session(session_id: String, cwd: String, terminal: String) -> Result<(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // 单实例:重复启动 exe 时不再开新窗口,而是把已有窗口带到前台
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             delete_session,

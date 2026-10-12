@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { TerminalSquare } from "lucide-react";
 import { toast } from "sonner";
@@ -13,8 +14,11 @@ interface ResumeDialogProps {
 }
 
 export function ResumeDialog({ session, terminals, onOpenChange }: ResumeDialogProps) {
+  const [busy, setBusy] = useState(false);
+
   async function pick(terminalId: string) {
-    if (!session) return;
+    if (!session || busy) return;
+    setBusy(true);
     try {
       await invoke("resume_session", {
         sessionId: session.sessionId,
@@ -24,6 +28,8 @@ export function ResumeDialog({ session, terminals, onOpenChange }: ResumeDialogP
       onOpenChange(false);
     } catch (error) {
       toast.error(`恢复会话失败:${String(error)}`);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -41,6 +47,7 @@ export function ResumeDialog({ session, terminals, onOpenChange }: ResumeDialogP
               <Button
                 key={terminal.id}
                 variant="outline"
+                disabled={busy}
                 className="justify-start font-normal"
                 onClick={() => void pick(terminal.id)}
               >
